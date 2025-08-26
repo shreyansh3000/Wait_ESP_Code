@@ -215,8 +215,8 @@ unsigned long getEpochTime() {
     timeinfo.tm_year = year - 1900;  // years since 1900
     timeinfo.tm_mon = month - 1;     // months since January (0-11)
     timeinfo.tm_mday = day;
-    timeinfo.tm_hour = hour-5;
-    timeinfo.tm_min = minute-30;
+    timeinfo.tm_hour = hour;
+    timeinfo.tm_min = minute;
     timeinfo.tm_sec = second;
     timeinfo.tm_isdst = 0;
     
