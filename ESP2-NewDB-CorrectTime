@@ -1,0 +1,527 @@
+
+#define TINY_GSM_MODEM_SIM7600
+#define TINY_GSM_DEBUG        Serial
+
+/* ---------------- libraries ------------------------------------- */
+#include <TinyGSM.h>
+#include <ArduinoHttpClient.h>
+#include <ArduinoJson.h>
+#include "SSLClient.h"
+#include "utilities.h"
+#include "certs.h"
+#include "esp_system.h"
+#include <time.h>
+
+/* ---------------- board / carrier parameters -------------------- */
+const char apn[]      = "airtelgprs.com";
+const char server[]   = "api.linear-amptech.com";
+const char resource[] = "/service/poletelemetry";
+const int  port       = 443;
+
+// Hardcoded serial number
+const char SERIAL_NO[] = "2222";
+
+/* ---------------- IO pins & constants --------------------------- */
+#define MODEM_TX     17
+#define MODEM_RX     16
+#define MODEM_PWRKEY 26
+#define MODEM_RESET  27
+#define UART_BAUD    115200    // Keep modem at 115200 for stability
+
+#define TIME_TO_SLEEP 30
+
+#define SerialMon Serial
+#define SerialAT  Serial1
+HardwareSerial EspSerial(2);
+
+/* ---------------- Time management variables -------------------- */
+unsigned long lastTimeUpdate = 0;
+const unsigned long TIME_UPDATE_INTERVAL = 30000; // Update every 30 seconds
+long timeOffset = 0;
+bool timeSynced = false;
+unsigned long lastSyncMillis = 0;
+
+/* ---------------- Speed data collection ----------------------- */
+struct SpeedData {
+  float speed;
+  unsigned long timestamp;  // Will store epoch timestamp
+};
+
+const int MAX_SPEED_RECORDS = 100;  // Maximum records to store in 1 minute
+SpeedData speedBuffer[MAX_SPEED_RECORDS];
+int speedBufferIndex = 0;
+unsigned long lastSendTime = 0;
+const unsigned long SEND_INTERVAL = 60000;  // 1 minute in milliseconds
+
+/* ---------------- Updated payload structure to match ESP1 ------------------------------- */
+struct Payload {
+  char device[20];
+  char type[10];
+  int count;
+  float speed;
+  int setvalue;
+  int num;
+} __attribute__((packed));
+static_assert(sizeof(Payload) == 46, "Payload layout mismatch!");
+
+TinyGsm       modem(SerialAT);
+TinyGsmClient baseClient(modem, 0);
+SSLClient     secure_layer(&baseClient);
+HttpClient    client(secure_layer, server, port);
+
+constexpr uint8_t  MAX_HTTP_RETRIES      = 3;
+constexpr uint32_t TCP_CONNECT_TO_MS     = 20000;
+constexpr uint32_t TLS_RW_TO_MS          = 7000;
+constexpr uint32_t HTTP_RESP_TO_MS       = 7000;
+
+bool initModemOnce();
+bool ensurePdp();
+void configureHttpLayer();
+bool postSpeedDataArray();
+void addSpeedData(float speed, unsigned long epochTime);
+void light_sleep(uint32_t sec);
+void flushUART2();
+bool readCompletePayload(Payload* pkt);
+bool validatePayload(const Payload& p);
+unsigned long getEpochTime();
+bool syncNetworkTime();
+
+void setup()
+{
+  esp_reset_reason_t reset_reason = esp_reset_reason();
+    
+  if (reset_reason == ESP_RST_BROWNOUT) {
+    Serial.println("Brownout reset detected - implementing recovery sequence");
+    delay(1000); // Wait for power to stabilize
+  }
+
+  SerialMon.begin(115200);
+  delay(100);
+  
+  SerialMon.println(F("=== ESP2 Starting ==="));
+
+  // Initialize serial communications
+  SerialAT.begin(UART_BAUD, SERIAL_8N1, MODEM_RX, MODEM_TX);
+  EspSerial.begin(19200, SERIAL_8N1, 14, 12);
+  EspSerial.setTimeout(1000);
+
+  SerialMon.printf("Free heap at start: %d bytes\n", ESP.getFreeHeap());
+  SerialMon.printf("Expected payload size: %d bytes\n", sizeof(Payload));
+
+  // Initialize modem control pins
+  pinMode(MODEM_RESET, OUTPUT);  
+  digitalWrite(MODEM_RESET, HIGH);
+  pinMode(MODEM_PWRKEY, OUTPUT); 
+  digitalWrite(MODEM_PWRKEY, HIGH);
+  delay(1500);                    
+  digitalWrite(MODEM_PWRKEY, LOW);
+
+  // Configure SSL (insecure for testing)
+  secure_layer.setInsecure();
+
+  // Initialize modem
+  if (!initModemOnce()) {
+    SerialMon.println(F("❌ Modem init failed – halting"));
+    for (;;) { delay(1000); }
+  }
+
+  // Sync time immediately on startup
+  if (syncNetworkTime()) {
+    SerialMon.println("✅ Time synchronized on startup");
+  } else {
+    SerialMon.println("⚠️ Could not sync time on startup, will retry");
+  }
+
+  configureHttpLayer();
+  
+  // Initialize timing
+  lastSendTime = millis();
+  speedBufferIndex = 0;
+  
+  SerialMon.println(F("✅ Receiver ready - collecting speed data"));
+  SerialMon.printf("Serial Number: %s\n", SERIAL_NO);
+  SerialMon.println(F("Will send data every 60 seconds"));
+}
+
+void loop()
+{
+  // Periodically sync time with network (every 30 seconds)
+  if (millis() - lastTimeUpdate > TIME_UPDATE_INTERVAL) {
+    syncNetworkTime();
+  }
+  
+  // Handle incoming data from ESP1
+  if (EspSerial.available() >= sizeof(Payload)) {
+    // Get epoch timestamp when data is received
+    unsigned long receivedTime = getEpochTime();
+    
+    Payload pkt;
+    
+    if (readCompletePayload(&pkt)) {
+      SerialMon.printf("📦 Received: dev='%s' type='%s' speed=%.2f count=%d set=%d num=%d at epoch: %lu\n",
+                       pkt.device, pkt.type, pkt.speed, pkt.count, pkt.setvalue, pkt.num, receivedTime);
+      
+      if (validatePayload(pkt)) {
+        // Store speed data if it's meaningful (convert to absolute value)
+        if (pkt.speed > 0 || pkt.speed < 0) {
+          float absoluteSpeed = abs(pkt.speed);
+          addSpeedData(absoluteSpeed, receivedTime);
+          SerialMon.printf("📊 Speed %.2f (absolute: %.2f) stored with epoch timestamp %lu (%d records buffered)\n", 
+                           pkt.speed, absoluteSpeed, receivedTime, speedBufferIndex);
+        }
+        
+        // Handle communication back to ESP1 if needed
+        if (pkt.setvalue == 3 && pkt.num > 0) {
+          SerialMon.printf("📤 Sending ACK to ESP1 for num=%d\n", pkt.num);
+          
+          // Create response packet
+          Payload response;
+          memset(&response, 0, sizeof(response));
+          strncpy(response.device, "ESP2", sizeof(response.device) - 1);
+          strncpy(response.type, "ACK", sizeof(response.type) - 1);
+          response.setvalue = 0;
+          response.num = pkt.num;
+          
+          // Send response back to ESP1
+          EspSerial.write((uint8_t*)&response, sizeof(response));
+          SerialMon.println("✅ ACK sent to ESP1");
+        }
+      } else {
+        SerialMon.println("❌ Invalid payload, discarding");
+        flushUART2();
+      }
+    } else {
+      SerialMon.println("❌ Failed to read complete payload");
+      flushUART2();
+    }
+  }
+  
+  // Check if it's time to send accumulated speed data
+  if (millis() - lastSendTime >= SEND_INTERVAL) {
+    if (speedBufferIndex > 0) {
+      SerialMon.printf("⏰ 1 minute elapsed - sending %d speed records\n", speedBufferIndex);
+      
+      if (postSpeedDataArray()) {
+        SerialMon.println("✅ Speed data array sent successfully");
+      } else {
+        SerialMon.println("❌ Failed to send speed data array");
+      }
+    } else {
+      SerialMon.println("⏰ 1 minute elapsed - no speed data to send");
+    }
+    
+    // Reset for next interval
+    speedBufferIndex = 0;
+    lastSendTime = millis();
+  }
+  
+  delay(10); // Small delay to prevent system overload
+}
+
+bool syncNetworkTime() {
+  int year, month, day, hour, minute, second;
+  float timezone;
+  
+  if (modem.getNetworkTime(&year, &month, &day, &hour, &minute, &second, &timezone)) {
+    // Convert to epoch timestamp
+    struct tm timeinfo;
+    timeinfo.tm_year = year - 1900;
+    timeinfo.tm_mon = month - 1;
+    timeinfo.tm_mday = day;
+    timeinfo.tm_hour = hour;
+    timeinfo.tm_min = minute;
+    timeinfo.tm_sec = second;
+    timeinfo.tm_isdst = 0;
+    
+    time_t networkEpoch = mktime(&timeinfo);
+    
+    // Calculate offset between network time and our millis-based time
+    timeOffset = networkEpoch - (millis() / 1000);
+    timeSynced = true;
+    lastSyncMillis = millis();
+    lastTimeUpdate = millis();
+    
+    SerialMon.printf("🕒 Time synced: %04d-%02d-%02d %02d:%02d:%02d (epoch: %lu)\n", 
+                     year, month, day, hour, minute, second, networkEpoch);
+    return true;
+  } else {
+    SerialMon.println("⚠️ Failed to sync network time");
+    lastTimeUpdate = millis(); // Still update to prevent constant retries
+    return false;
+  }
+}
+
+unsigned long getEpochTime() {
+  // If we've never synced time, try to sync now
+  if (!timeSynced) {
+    syncNetworkTime();
+  }
+  
+  // Calculate current epoch time based on offset and elapsed millis
+  unsigned long currentEpoch = (millis() / 1000) + timeOffset;
+  return currentEpoch;
+}
+
+void addSpeedData(float speed, unsigned long epochTime) {
+  if (speedBufferIndex < MAX_SPEED_RECORDS) {
+    speedBuffer[speedBufferIndex].speed = speed;
+    speedBuffer[speedBufferIndex].timestamp = epochTime;
+    speedBufferIndex++;
+  } else {
+    SerialMon.println("⚠️ Speed buffer full - dropping oldest record");
+    // Shift array left and add new record at the end
+    for (int i = 0; i < MAX_SPEED_RECORDS - 1; i++) {
+      speedBuffer[i] = speedBuffer[i + 1];
+    }
+    speedBuffer[MAX_SPEED_RECORDS - 1].speed = speed;
+    speedBuffer[MAX_SPEED_RECORDS - 1].timestamp = epochTime;
+  }
+}
+
+bool postSpeedDataArray() {
+  // Create JSON array with all collected speed data
+  DynamicJsonDocument doc(2048);
+  JsonArray dataArray = doc.to<JsonArray>();
+  
+  for (int i = 0; i < speedBufferIndex; i++) {
+    JsonObject record = dataArray.createNestedObject();
+    record["serialno"] = SERIAL_NO;
+    record["timestamp"] = speedBuffer[i].timestamp;
+    record["speed"] = String(roundf(speedBuffer[i].speed * 100) / 100, 1);
+  }
+  
+  String body;
+  size_t jsonSize = serializeJson(doc, body);
+  
+  if (jsonSize == 0) {
+    SerialMon.println("❌ JSON serialization failed");
+    return false;
+  }
+  
+  SerialMon.printf("📋 JSON payload (%d bytes):\n%s\n", body.length(), body.c_str());
+
+  for (uint8_t attempt = 1; attempt <= MAX_HTTP_RETRIES; ++attempt) {
+    // Check network status first
+    SerialMon.printf("🔍 Network check attempt %d - RSSI: %d\n", 
+                     attempt, modem.getSignalQuality());
+    
+    if (!ensurePdp()) {
+      SerialMon.println(F("No PDP – trying to re-establish connection"));
+      modem.gprsDisconnect();
+      delay(2000);
+      if (!modem.gprsConnect(apn, "", "")) {
+        SerialMon.println(F("Failed to reconnect GPRS"));
+        continue;
+      }
+    }
+
+    // Verify we have an IP
+    IPAddress localIP = modem.localIP();
+    if (localIP == IPAddress(0, 0, 0, 0)) {
+      SerialMon.println(F("❌ No valid IP address"));
+      continue;
+    }
+    SerialMon.print(F("📶 Connected with IP: "));
+    SerialMon.println(localIP);
+
+    // Clean up connections more thoroughly
+    client.stop(); 
+    secure_layer.stop(); 
+    baseClient.stop();
+    delay(500);
+
+    SerialMon.printf("📡 POST https://%s%s (%u B) attempt %u/%u\n",
+                     server, resource, body.length(), attempt, MAX_HTTP_RETRIES);
+
+    // Use the standard post method with proper error checking
+    client.beginRequest();
+    client.post(resource);
+    client.sendHeader("Content-Type", "application/json");
+    client.sendHeader("Content-Length", body.length());
+    client.sendHeader("Connection", "close");
+    client.beginBody();
+    client.print(body);
+    client.endRequest();
+    
+    SerialMon.println("✅ Request sent successfully");
+
+    // Wait for response with timeout
+    unsigned long responseStart = millis();
+    int status = 0;
+    
+    while (status == 0 && (millis() - responseStart) < HTTP_RESP_TO_MS) {
+      status = client.responseStatusCode();
+      if (status == 0) {
+        delay(100);
+      }
+    }
+
+    SerialMon.printf("↦ HTTP %d\n", status);
+
+    if (status >= 200 && status < 300) {
+      String response = client.responseBody();
+      SerialMon.printf("✅ Success: %s\n", response.c_str());
+      client.stop();
+      return true;
+    } else if (status == 0) {
+      SerialMon.println("❌ Response timeout");
+
+    } else {
+      SerialMon.printf("❌ HTTP error: %d\n", status);
+      String errorResponse = client.responseBody();
+      SerialMon.printf("Error response: %s\n", errorResponse.c_str());
+    }
+
+    client.stop();
+    delay(attempt * 2000);
+  }
+
+  SerialMon.println(F("🚨 all retries exhausted"));
+  SerialMon.println(F("⚠️ Will retry in next cycle"));
+  return false;
+}
+
+bool readCompletePayload(Payload* pkt)
+{
+  if (!pkt) return false;
+  
+  memset(pkt, 0, sizeof(Payload));
+  
+  size_t totalBytesRead = 0;
+  unsigned long startTime = millis();
+  const unsigned long timeout = 2000;
+  
+  while (totalBytesRead < sizeof(Payload) && (millis() - startTime) < timeout) {
+    if (EspSerial.available()) {
+      size_t bytesToRead = sizeof(Payload) - totalBytesRead;
+      size_t available = EspSerial.available();
+      
+      if (available < bytesToRead) {
+        bytesToRead = available;
+      }
+      
+      size_t bytesRead = EspSerial.readBytes(
+        reinterpret_cast<uint8_t*>(pkt) + totalBytesRead, 
+        bytesToRead
+      );
+      
+      totalBytesRead += bytesRead;
+      
+      if (totalBytesRead < sizeof(Payload)) {
+        delay(5);
+      }
+    } else {
+      delay(1);
+    }
+  }
+  
+  bool success = (totalBytesRead == sizeof(Payload));
+  if (!success) {
+    SerialMon.printf("❌ Incomplete read: %u/%u bytes\n", totalBytesRead, sizeof(Payload));
+  }
+  
+  return success;
+}
+
+bool validatePayload(const Payload& p)
+{
+  // Check for reasonable count values
+  if (p.count < 0 || p.count > 10000) {
+    SerialMon.printf("❌ Invalid count: %d\n", p.count);
+    return false;
+  }
+  
+  // Check device string (should be null-terminated within bounds)
+  bool deviceValid = false;
+  for (int i = 0; i < 20; i++) {
+    if (p.device[i] == '\0') {
+      deviceValid = true;
+      break;
+    }
+  }
+  if (!deviceValid) {
+    SerialMon.println("❌ Invalid device string");
+    return false;
+  }
+  
+  // Check type string (should be null-terminated within bounds)
+  bool typeValid = false;
+  for (int i = 0; i < 10; i++) {
+    if (p.type[i] == '\0') {
+      typeValid = true;
+      break;
+    }
+  }
+  if (!typeValid) {
+    SerialMon.println("❌ Invalid type string");
+    return false;
+  }
+  
+  return true;
+}
+
+void configureHttpLayer()
+{
+  baseClient.setTimeout(TCP_CONNECT_TO_MS);
+  secure_layer.setTimeout(TLS_RW_TO_MS);
+  secure_layer.setHandshakeTimeout(TCP_CONNECT_TO_MS / 1000);
+  client.setHttpResponseTimeout(HTTP_RESP_TO_MS);
+  client.connectionKeepAlive();
+}
+
+bool initModemOnce()
+{
+  SerialMon.println(F("Initializing modem…"));
+  if (!modem.init() && !modem.restart()) return false;
+
+  for (uint8_t i = 0; i < 5; ++i) {
+    if (modem.setNetworkMode(54)) break;
+    delay(500);
+  }
+
+  SerialMon.println(F("Waiting for network…"));
+  if (!modem.waitForNetwork(300000UL)) return false;
+
+  if (!modem.gprsConnect(apn, "", "")) return false;
+
+  SerialMon.print(F("PDP attached. IP=")); 
+  SerialMon.println(modem.localIP());
+  modem.sendAT("+CPSMS=0");
+  modem.sendAT("+CEDRXS=0");
+  return true;
+}
+
+bool ensurePdp()
+{
+  if (modem.isGprsConnected()) return true;
+
+  SerialMon.println(F("PDP down – re‑attaching…"));
+  modem.gprsDisconnect();
+
+  for (uint8_t i = 0; i < 5; ++i) {
+    if (modem.gprsConnect(apn, "", "")) {
+      SerialMon.print(F("Re‑attached. IP=")); 
+      SerialMon.println(modem.localIP());
+      return true;
+    }
+    delay(100);
+  }
+  SerialMon.println(F("Re‑attach failed"));
+  return false;
+}
+
+void flushUART2() {
+  SerialMon.print(F("🧹 Flushing UART2... "));
+  int flushed = 0;
+  while (EspSerial.available()) {
+    EspSerial.read();
+    flushed++;
+  }
+  SerialMon.printf("flushed %d bytes\n", flushed);
+}
+
+void light_sleep(uint32_t sec)
+{
+  esp_sleep_enable_timer_wakeup(uint64_t(sec) * 1'000'000ULL);
+  esp_light_sleep_start();
+}
