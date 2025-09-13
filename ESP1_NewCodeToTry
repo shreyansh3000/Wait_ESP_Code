@@ -1,0 +1,455 @@
+
+#include <SPI.h>
+#include <LoRa.h>
+#include <Arduino.h>
+#include <ArduinoJson.h>
+
+#define BOARD_ID 2	          // set 1 for PCB A, 2 for PCB B
+
+const int MAX_MSG_LENGTH = 7;                                          
+char msg[MAX_MSG_LENGTH];                                              
+static int ind=0;                                                      
+ 
+/* ----------------- LoRa pins & radio --------------------- */
+const int LORA_PWR   = 4;   
+const int LORA_CS    = 5;
+const int LORA_RST   = 27;
+const int LORA_DIO0  = 35;
+const long RF_FREQ   = 868E6;   
+const byte ADDR_ME   = (BOARD_ID == 1 ? 0xAA : 0xBB);
+const byte ADDR_PEER = (BOARD_ID == 1 ? 0xBB : 0xAA);
+
+// Timing constants
+constexpr uint32_t VEHICLE_DETECTION_COOLDOWN = 3000;  // 3 seconds between vehicle detections
+constexpr uint32_t VEHICLE_TIMEOUT = 5000;             // 5 seconds max for same vehicle
+constexpr uint32_t COUNT_INTERVAL = 10000;             // 10 seconds for count requests
+constexpr uint32_t LORA_TIMEOUT = 50;                  // 50ms max for LoRa operations
+
+// Output durations
+const int lightOnDuration = 3000;                      
+const int hornOnDuration = 4000;                       
+const int triggerOnDuration = 1000;                    
+
+// Timing variables
+unsigned long lastVehicleTime = 0;
+unsigned long lastCountTime = 0;
+unsigned long lightOffTime = 0;
+unsigned long hornOffTime = 0;
+unsigned long triggerOffTime = 0;
+unsigned long lastLoRaCheck = 0;
+
+// Vehicle detection variables
+bool vehicleActive = false;
+float lastReportedSpeed = 0;
+unsigned long vehicleStartTime = 0;
+bool outputsActive = false;
+
+// NEW: Track ESP2 communication to prevent duplicates
+unsigned long lastESP2SendTime = 0;
+float lastSentSpeed = 0;
+constexpr uint32_t ESP2_SEND_COOLDOWN = 500; // Minimum 500ms between ESP2 sends
+
+// Speed filtering
+const float SPEED_THRESHOLD = 10.0;
+const int SPEED_SAMPLES = 3;
+float speedBuffer[SPEED_SAMPLES] = {0};
+int speedIndex = 0;
+int validSpeedCount = 0;
+
+struct Payload {
+  char device[20];
+  char type[10];
+  int count;
+  float speed;
+  int setvalue;
+  int num;
+} __attribute__((packed));
+
+Payload espData;
+
+const int trigger = 21;                                                
+const int Light = 32;                                                  
+const int Horn = 33;                                                   
+
+// Function prototypes
+void sendLoRa();
+void sendToESP();
+void activateOutputs(float speed, bool sendToESP2 = true);
+void extendOutputs(float speed, bool sendToESP2 = true);
+void deactivateOutputs();
+void handleSpeedData(float speed);
+void handleLoRaCommunication();
+void handleVehicleCount();
+float getFilteredSpeed();
+bool isValidVehicleSpeed(float speed);
+
+void sendLoRa() {
+  if (millis() - lastLoRaCheck < 10) return; // Rate limit LoRa operations
+  
+  LoRa.beginPacket();
+  LoRa.write(ADDR_ME);
+  LoRa.endPacket();
+  LoRa.idle();      
+  
+  lastLoRaCheck = millis();
+  LoRa.receive();  // Non-blocking receive mode
+}
+
+void sendToESP() {
+  unsigned long currentTime = millis();
+  
+  // Prevent duplicate sends - only send if enough time has passed AND speed is different
+  if (currentTime - lastESP2SendTime < ESP2_SEND_COOLDOWN && 
+      abs(espData.speed - lastSentSpeed) < 1.0) {
+    return; // Skip sending to prevent duplicates
+  }
+  
+  if (espData.speed != 0 || espData.count != 0) {
+    Serial1.write((uint8_t*)&espData, sizeof(espData));   
+    Serial.printf("Sent to ESP2 - Speed: %.2f, Count: %d\n", espData.speed, espData.count);
+    
+    // Update tracking variables
+    lastESP2SendTime = currentTime;
+    lastSentSpeed = espData.speed;
+    
+    // Reset data after sending
+    espData.speed = 0;
+    espData.count = 0;
+  }
+}
+
+void activateOutputs(float speed, bool sendToESP2) {
+  unsigned long currentTime = millis();
+  
+  // Calculate turn-off times
+  triggerOffTime = currentTime + triggerOnDuration;
+  lightOffTime = currentTime + lightOnDuration;
+  hornOffTime = currentTime + hornOnDuration;
+  
+  // Activate outputs
+  digitalWrite(trigger, HIGH);
+  digitalWrite(Light, HIGH);
+  digitalWrite(Horn, HIGH);
+  
+  outputsActive = true;
+  
+  // Send LoRa signal
+  sendLoRa();
+  
+  // Prepare and send data to ESP2 if requested
+  if (sendToESP2) {
+    strncpy(espData.device, "WAIT-ACME-0001", sizeof(espData.device) - 1);
+    espData.device[sizeof(espData.device) - 1] = '\0';
+    strncpy(espData.type, "Duplex", sizeof(espData.type) - 1);
+    espData.type[sizeof(espData.type) - 1] = '\0';
+    espData.speed = speed;
+    
+    sendToESP();
+  }
+  
+  Serial.printf("Vehicle detected! Speed: %.2f km/h - Outputs activated\n", speed);
+}
+
+void extendOutputs(float speed, bool sendToESP2) {
+  unsigned long currentTime = millis();
+  
+  // Extend the turn-off times
+  triggerOffTime = currentTime + triggerOnDuration;
+  lightOffTime = currentTime + lightOnDuration;
+  hornOffTime = currentTime + hornOnDuration;
+  
+  // Ensure outputs are on (they should already be, but just in case)
+  digitalWrite(trigger, HIGH);
+  digitalWrite(Light, HIGH);
+  digitalWrite(Horn, HIGH);
+  
+  outputsActive = true;
+  
+  // Send LoRa signal for the new detection
+  sendLoRa();
+  
+  // Prepare and send data to ESP2 if requested and not duplicate
+  if (sendToESP2) {
+    strncpy(espData.device, "WAIT-ACME-0001", sizeof(espData.device) - 1);
+    espData.device[sizeof(espData.device) - 1] = '\0';
+    strncpy(espData.type, "Duplex", sizeof(espData.type) - 1);
+    espData.type[sizeof(espData.type) - 1] = '\0';
+    espData.speed = speed;
+    
+    sendToESP();
+  }
+  
+  Serial.printf("Additional vehicle detected! Speed: %.2f km/h - Outputs extended\n", speed);
+}
+
+void deactivateOutputs() {
+  unsigned long currentTime = millis();
+  bool anyActive = false;
+  
+  if (currentTime >= triggerOffTime && digitalRead(trigger) == HIGH) {
+    digitalWrite(trigger, LOW);
+    Serial.println("Trigger OFF");
+  } else if (digitalRead(trigger) == HIGH) {
+    anyActive = true;
+  }
+  
+  if (currentTime >= lightOffTime && digitalRead(Light) == HIGH) {
+    digitalWrite(Light, LOW);
+    Serial.println("Light OFF");
+  } else if (digitalRead(Light) == HIGH) {
+    anyActive = true;
+  }
+  
+  if (currentTime >= hornOffTime && digitalRead(Horn) == HIGH) {
+    digitalWrite(Horn, LOW);
+    Serial.println("Horn OFF");
+  } else if (digitalRead(Horn) == HIGH) {
+    anyActive = true;
+  }
+  
+  outputsActive = anyActive;
+}
+
+float getFilteredSpeed() {
+  if (validSpeedCount < SPEED_SAMPLES) return 0;
+  
+  float sum = 0;
+  for (int i = 0; i < SPEED_SAMPLES; i++) {
+    sum += speedBuffer[i];
+  }
+  return sum / SPEED_SAMPLES;
+}
+
+bool isValidVehicleSpeed(float speed) {
+  return (abs(speed) >= SPEED_THRESHOLD && abs(speed) <= 200.0); // Reasonable speed range
+}
+
+void handleSpeedData(float speed) {
+  // Add to speed buffer for filtering
+  speedBuffer[speedIndex] = speed;
+  speedIndex = (speedIndex + 1) % SPEED_SAMPLES;
+  if (validSpeedCount < SPEED_SAMPLES) validSpeedCount++;
+  
+  if (!isValidVehicleSpeed(speed)) {
+    return; // Ignore invalid speeds
+  }
+  
+  unsigned long currentTime = millis();
+  float filteredSpeed = getFilteredSpeed();
+  
+  // MODIFIED: Handle both new detections and detections while outputs are active
+  if (!vehicleActive) {
+    if (currentTime - lastVehicleTime >= VEHICLE_DETECTION_COOLDOWN) {
+      // New vehicle detected
+      vehicleActive = true;
+      vehicleStartTime = currentTime;
+      lastReportedSpeed = filteredSpeed;
+      lastVehicleTime = currentTime;
+      
+      activateOutputs(filteredSpeed, true);
+    }
+  } else {
+    // Vehicle is already active - check for timeout
+    if (currentTime - vehicleStartTime >= VEHICLE_TIMEOUT) {
+      vehicleActive = false;
+      Serial.println("Vehicle detection timed out");
+    }
+    
+    // NEW: If outputs are currently active and we detect another vehicle, extend timing
+    if (outputsActive && (currentTime - lastVehicleTime >= VEHICLE_DETECTION_COOLDOWN)) {
+      Serial.println("Additional vehicle detected while outputs active - extending duration");
+      extendOutputs(filteredSpeed, true);
+      lastVehicleTime = currentTime; // Update last detection time
+      lastReportedSpeed = filteredSpeed; // Update speed
+    }
+  }
+}
+
+void handleLoRaCommunication() {
+  // Non-blocking LoRa packet check
+  int packetSize = LoRa.parsePacket();
+  
+  if (packetSize > 0) {
+    uint8_t incoming = LoRa.read();
+    Serial.printf("LoRa packet: %d byte(s), value: 0x%02X\n", packetSize, incoming);
+    
+    if (packetSize == 1 && incoming == ADDR_PEER) {
+      Serial.println("✅ Valid peer signal - activating/extending outputs");
+      
+      unsigned long currentTime = millis();
+      
+      // MODIFIED: If outputs are already active, extend them; otherwise activate
+      if (outputsActive) {
+        // FIXED: Only extend timing if it would actually extend the duration
+        unsigned long newTriggerTime = currentTime + triggerOnDuration;
+        unsigned long newLightTime = currentTime + lightOnDuration;
+        unsigned long newHornTime = currentTime + hornOnDuration;
+        
+        if (newTriggerTime > triggerOffTime) triggerOffTime = newTriggerTime;
+        if (newLightTime > lightOffTime) lightOffTime = newLightTime;
+        if (newHornTime > hornOffTime) hornOffTime = newHornTime;
+        
+        // Ensure outputs remain on
+        if (digitalRead(trigger) == LOW) digitalWrite(trigger, HIGH);
+        if (digitalRead(Light) == LOW) digitalWrite(Light, HIGH);
+        if (digitalRead(Horn) == LOW) digitalWrite(Horn, HIGH);
+        
+        Serial.println("Outputs extended due to peer LoRa signal");
+        Serial.printf("Extended timings - Trigger: %lu, Light: %lu, Horn: %lu\n", 
+                      triggerOffTime, lightOffTime, hornOffTime);
+      } else {
+        // Activate outputs
+        triggerOffTime = currentTime + triggerOnDuration;
+        lightOffTime = currentTime + lightOnDuration;
+        hornOffTime = currentTime + hornOnDuration;
+        
+        digitalWrite(trigger, HIGH);
+        digitalWrite(Light, HIGH);
+        digitalWrite(Horn, HIGH);
+        outputsActive = true;
+        Serial.println("Outputs activated due to peer LoRa signal");
+      }
+    } else {
+      Serial.println("⚠️ Invalid LoRa packet ignored");
+    }
+    
+    // Immediately return to receive mode
+    LoRa.receive();
+  }
+}
+
+void handleVehicleCount() {
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastCountTime >= COUNT_INTERVAL) {
+    Serial2.write("N?");
+    lastCountTime = currentTime;
+    
+    // Non-blocking read with timeout
+    unsigned long startTime = millis();
+    char buffer[64] = {0}; // Increased buffer size
+    int bytesRead = 0;
+    
+    while (millis() - startTime < 100 && bytesRead < 63) { // 100ms timeout
+      if (Serial2.available()) {
+        char c = Serial2.read();
+        if (c == '\n') break;
+        buffer[bytesRead++] = c;
+      }
+    }
+    
+    if (bytesRead > 0) {
+      buffer[bytesRead] = '\0';
+      String jsonString = String(buffer);
+      
+      DynamicJsonDocument doc(128);
+      DeserializationError error = deserializeJson(doc, jsonString);
+      
+      if (!error && doc.containsKey("DetectedObjectCount")) {
+        espData.count = doc["DetectedObjectCount"].as<int>();
+        Serial.printf("Vehicle count: %d\n", espData.count);
+        sendToESP();
+      } else {
+        Serial.println("Failed to parse vehicle count JSON");
+      }
+    }
+  }
+}
+
+void setup() {
+  pinMode(LORA_PWR, OUTPUT); 
+  digitalWrite(LORA_PWR, HIGH); 
+  delay(10); // Minimal delay
+
+  Serial.begin(19200);                                                 
+  Serial1.begin(19200, SERIAL_8N1, 14, 12);                            
+  Serial2.begin(19200, SERIAL_8N1, 16, 17);                            
+
+  // Configure output pins
+  pinMode(trigger, OUTPUT);
+  pinMode(Light, OUTPUT);
+  pinMode(Horn, OUTPUT);
+
+  // Ensure all outputs start LOW
+  digitalWrite(trigger, LOW);
+  digitalWrite(Light, LOW);
+  digitalWrite(Horn, LOW);
+
+  // Initialize LoRa
+  LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
+  if (!LoRa.begin(RF_FREQ)) { 
+    Serial.println("LoRa init failed"); 
+    while (1); 
+  }
+  
+  LoRa.setSpreadingFactor(12);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setTxPower(30);
+  LoRa.setSyncWord(0x42); 
+  LoRa.enableCrc(); 
+  LoRa.receive();
+  
+  Serial.printf("PCB %d ready (addr 0x%02X)\n", BOARD_ID, ADDR_ME);
+  
+  // Initialize struct
+  memset(&espData, 0, sizeof(espData));
+  
+  // Initialize tracking variables
+  lastESP2SendTime = 0;
+  lastSentSpeed = 0;
+  
+  Serial.println("System initialized - Ready for vehicle detection");
+}
+
+void loop() {
+  // Handle radar data input
+  while (Serial2.available() > 0) {
+    char inByte = Serial2.read();
+    Serial.print(inByte);
+    
+    if (inByte != '\n' && ind < MAX_MSG_LENGTH - 1) {
+      msg[ind] = inByte;
+      ind++;
+    } else {
+      msg[ind] = '\0';
+      ind = 0;
+      
+      float speed = atof(msg);
+      if (speed != 0) {
+        handleSpeedData(speed);
+      }
+    }
+  }
+  
+  // Handle output timing (always check)
+  deactivateOutputs();
+  
+  // Handle LoRa communication
+  handleLoRaCommunication();
+  
+  // Handle ESP1 to ESP2 communication
+  while (Serial1.available() > 0) {
+    Serial1.readBytes((uint8_t*)&espData, sizeof(espData));
+    
+    if (espData.setvalue == 3) {
+      Serial.printf("Received command: %d\n", espData.num);
+      Serial2.write("N!");
+    }
+    
+    // Reset command data
+    espData.setvalue = 0;
+    espData.num = 0;
+  }
+  
+  // Handle periodic vehicle count
+  handleVehicleCount();
+  
+  // Reset vehicle detection after timeout
+  if (vehicleActive && (millis() - vehicleStartTime >= VEHICLE_TIMEOUT)) {
+    vehicleActive = false;
+    Serial.println("Vehicle detection reset after timeout");
+  }
+  
+  // Very small delay to prevent overwhelming the system
+  delay(1); // Minimal delay for stability
+}
